@@ -1,0 +1,40 @@
+# ============================================================
+#  ClickHouse 配置 - TTL 保留 2 年
+# ============================================================
+# 挂载到 /etc/clickhouse-server/config.d/custom_config.xml
+
+<clickhouse>
+    <!-- 全局 TTL 策略: 数据保留 2 年, 可被表级 TTL 覆盖 -->
+    <merge_tree>
+        <!-- 2 年 = 730 天 (实际在 DDL 中定义, 这里是默认设置) -->
+        <min_bytes_for_wide_part>10485760</min_bytes_for_wide_part>
+
+        <!-- 后台合并策略优化 -->
+        <parts_to_throw_insert>500</parts_to_throw_insert>
+        <max_delay_to_insert>2</max_delay_to_insert>
+    </merge_tree>
+
+    <!-- 日志保留 2 年 -->
+    <logger>
+        <level>information</level>
+        <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+        <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
+        <size>1000M</size>
+        <count>24</count>
+    </logger>
+
+    <!-- 资源限制 -->
+    <max_concurrent_queries>200</max_concurrent_queries>
+    <max_memory_usage>10000000000</max_memory_usage>
+    <max_server_memory_usage_to_ram_ratio>0.7</max_server_memory_usage_to_ram_ratio>
+    <max_table_size_to_drop>0</max_table_size_to_drop>
+    <max_partition_size_to_drop>0</max_partition_size_to_drop>
+
+    <!-- 网络 -->
+    <listen_host>0.0.0.0</listen_host>
+    <http_port>8123</http_port>
+    <tcp_port>9000</tcp_port>
+
+    <!-- 时间戳时区 -->
+    <timezone>Asia/Shanghai</timezone>
+</clickhouse>

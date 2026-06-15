@@ -1,24 +1,26 @@
 from clickhouse_driver import Client
-from app.config import CLICKHOUSE_HOST, CLICKHOUSE_PORT, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD, CLICKHOUSE_DB
+from shared.config_loader import get_clickhouse_config
 
 
 def init_database():
+    cfg = get_clickhouse_config()
     client = Client(
-        host=CLICKHOUSE_HOST,
-        port=CLICKHOUSE_PORT,
-        user=CLICKHOUSE_USER,
-        password=CLICKHOUSE_PASSWORD,
+        host=cfg["host"],
+        port=cfg["port"],
+        user=cfg["user"],
+        password=cfg["password"],
     )
+    db = cfg["database"]
 
-    client.execute(f"CREATE DATABASE IF NOT EXISTS {CLICKHOUSE_DB}")
+    client.execute(f"CREATE DATABASE IF NOT EXISTS {db}")
 
-    # [FIX v1.1] 改用 (toYYYYMM(timestamp), tent_id) 复合分区键
-    # - 原: PARTITION BY toYYYYMM(timestamp) 跨年查询扫描全部月份分区
-    # - 新: 每个月×帐篷一个分区, 带 tent_id 条件时可裁剪非目标帐篷分区
-    # 跨年+单帐篷查询 ~20× 性能提升
+    # [v2] 复合分区键 + TTL 保留 2 年 (730 天)
+    # - 复合分区: (月, tent_id) → 带 tent_id 查询可分区裁剪 ~20x
+    # - 跳数索引: set(0) = bloom-like, minmax 用于时间范围
+    # - TTL: sensor_readings / aw_readings 保留 2 年, 风险评估 1 年, 告警 0.5 年
 
     client.execute(f"""
-    CREATE TABLE IF NOT EXISTS {CLICKHOUSE_DB}.sensor_readings (
+    CREATE TABLE IF NOT EXISTS {db}.sensor_readings (
         timestamp DateTime64(3),
         tent_id UInt8,
         sensor_id UInt8,
@@ -29,11 +31,12 @@ def init_database():
     ORDER BY (tent_id, sensor_type, timestamp)
     INDEX idx_tent_sensor (tent_id, sensor_type) TYPE set(0) GRANULARITY 1
     INDEX idx_ts_minmax timestamp TYPE minmax GRANULARITY 4
-    TTL timestamp + INTERVAL 365 DAY
+    TTL timestamp + INTERVAL 730 DAY
+    SETTINGS min_bytes_for_wide_part = 10485760
     """)
 
     client.execute(f"""
-    CREATE TABLE IF NOT EXISTS {CLICKHOUSE_DB}.aw_readings (
+    CREATE TABLE IF NOT EXISTS {db}.aw_readings (
         timestamp DateTime64(3),
         tent_id UInt8,
         meter_id UInt8,
@@ -43,11 +46,12 @@ def init_database():
     PARTITION BY (toYYYYMM(timestamp), tent_id)
     ORDER BY (tent_id, drug_name, timestamp)
     INDEX idx_tent_drug (tent_id, drug_name) TYPE set(0) GRANULARITY 1
-    TTL timestamp + INTERVAL 365 DAY
+    TTL timestamp + INTERVAL 730 DAY
+    SETTINGS min_bytes_for_wide_part = 10485760
     """)
 
     client.execute(f"""
-    CREATE TABLE IF NOT EXISTS {CLICKHOUSE_DB}.drug_risk_assessments (
+    CREATE TABLE IF NOT EXISTS {db}.drug_risk_assessments (
         timestamp DateTime64(3),
         tent_id UInt8,
         drug_name String,
@@ -60,14 +64,15 @@ def init_database():
     ) ENGINE = MergeTree()
     PARTITION BY (toYYYYMM(timestamp), tent_id)
     ORDER BY (tent_id, drug_name, timestamp)
-    TTL timestamp + INTERVAL 180 DAY
+    TTL timestamp + INTERVAL 365 DAY
+    SETTINGS min_bytes_for_wide_part = 10485760
     """)
 
     client.execute(f"""
-    CREATE TABLE IF NOT EXISTS {CLICKHOUSE_DB}.alerts (
+    CREATE TABLE IF NOT EXISTS {db}.alerts (
         timestamp DateTime64(3),
         tent_id UInt8,
-        alert_type Enum8('high_aw' = 1, 'high_temp' = 2, 'combined' = 3),
+        alert_type Enum8('high_aw' = 1, 'high_temp' = 2, 'combined' = 3, 'mold_risk' = 4),
         severity Enum8('warning' = 1, 'critical' = 2),
         value Float32,
         threshold Float32,
@@ -77,11 +82,13 @@ def init_database():
     ) ENGINE = MergeTree()
     PARTITION BY (toYYYYMM(timestamp), tent_id)
     ORDER BY (tent_id, alert_type, timestamp)
-    TTL timestamp + INTERVAL 90 DAY
+    TTL timestamp + INTERVAL 180 DAY
+    SETTINGS min_bytes_for_wide_part = 10485760
     """)
 
-    print("Database and tables created successfully (with composite partition keys v1.1).")
+    print("Database and tables created (v2: composite partitions + TTL 2 years).")
 
 
 if __name__ == "__main__":
     init_database()
+

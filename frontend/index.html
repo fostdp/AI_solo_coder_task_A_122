@@ -83,11 +83,10 @@
     </main>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <!-- [v2 重构] 独立组件 -->
+    <script src="/static/js/TentMap.js"></script>
+    <script src="/static/js/DrugRiskHeatmap.js"></script>
     <script src="/static/js/charts.js"></script>
-    <script src="/static/js/heatmap.js"></script>
-    <!-- [FIX v1.1] V2 Canvas ImageData 复用渲染器, 解决移动端内存泄漏 -->
-    <script src="/static/js/heatmap_canvas.js"></script>
-    <script src="/static/js/map.js"></script>
     <script src="/static/js/app.js"></script>
 </body>
 </html>

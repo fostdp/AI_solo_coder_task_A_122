@@ -1,0 +1,213 @@
+# ============================================================
+#  丝绸之路医疗帐篷系统 - 主配置
+#  [v2 重构] 所有模型参数与服务配置统一外置
+# ============================================================
+
+# --- ClickHouse ---
+clickhouse:
+  host: localhost
+  port: 9000
+  user: default
+  password: ""
+  database: silkroad_medical
+
+# --- Redis Stream (服务间通信) ---
+redis:
+  host: localhost
+  port: 6379
+  db: 0
+  password: ""
+  streams:
+    sensor_raw: "stream:sensor_raw"       # lora_ingest -> arrhenius / microbial
+    drug_risk: "stream:drug_risk"         # arrhenius + microbial -> alert_broker
+    alerts: "stream:alerts"               # alert_broker -> 通知/前端
+  consumer_groups:
+    arrhenius_workers: "group:arrhenius"
+    microbial_workers: "group:microbial"
+    alert_workers: "group:alerts"
+
+# --- LoRa / 采集 ---
+lora:
+  spreading_factors: [7, 8, 9, 10, 11, 12]
+  backoff_init_ms: 200
+  backoff_max_ms: 8000
+  retry_max: 3
+  dedup_window_seconds: 60   # 去重窗口: 同一 tent_id+sensor_id+timestamp 60s 内去重
+  report_interval_minutes: 30
+
+# --- 告警阈值 ---
+alerts:
+  water_activity_threshold: 0.6
+  temperature_threshold: 30.0
+  duration_hours: 4
+  check_interval_minutes: 30
+  email:
+    smtp_host: smtp.example.com
+    smtp_port: 587
+    smtp_user: ""
+    smtp_password: ""
+    to: archaeologist@example.com
+  satellite:
+    api_url: "http://satellite-gateway:8080/api/send"
+    enabled: false
+
+# --- 帐篷 (悬泉置遗址 5 座医疗帐篷) ---
+tents:
+  - id: 1
+    name: "悬泉置·东帐"
+    lat: 40.1435
+    lng: 94.6635
+    drugs: ["当归", "大黄", "甘草"]
+  - id: 2
+    name: "悬泉置·西帐"
+    lat: 40.1415
+    lng: 94.6600
+    drugs: ["黄芪", "白术", "茯苓"]
+  - id: 3
+    name: "悬泉置·南帐"
+    lat: 40.1405
+    lng: 94.6625
+    drugs: ["川芎", "白芍", "熟地"]
+  - id: 4
+    name: "悬泉置·北帐"
+    lat: 40.1445
+    lng: 94.6610
+    drugs: ["桂枝", "麻黄", "细辛"]
+  - id: 5
+    name: "悬泉置·中帐"
+    lat: 40.1420
+    lng: 94.6619
+    drugs: ["人参", "丹参", "五味子"]
+
+# --- 药材参数 (Arrhenius + 光降解 + Aw 临界) ---
+# Ea: 活化能 (J/mol)
+# A:  指前因子 (1/s)
+# T_ref: 参考温度 (K)
+# shelf_life_ref_months: 参考温度下的有效期 (月)
+# aw_critical: 临界水分活度
+# photosensitive: 是否光敏
+# k_photo, alpha, Eb: 光降解实验拟合参数
+drugs:
+  当归:
+    arrhenius: { Ea: 85000, A: 1.2e12, T_ref: 298.15, shelf_life_ref_months: 24 }
+    aw_critical: 0.65
+    photosensitive: true
+    light_degradation: { k_photo: 2.1e-8, alpha: 0.68, Eb: 28000 }
+
+  大黄:
+    arrhenius: { Ea: 78000, A: 8.5e11, T_ref: 298.15, shelf_life_ref_months: 18 }
+    aw_critical: 0.60
+    photosensitive: true
+    light_degradation: { k_photo: 3.8e-8, alpha: 0.75, Eb: 32000 }
+
+  甘草:
+    arrhenius: { Ea: 72000, A: 6.3e11, T_ref: 298.15, shelf_life_ref_months: 30 }
+    aw_critical: 0.62
+    photosensitive: false
+    light_degradation: { k_photo: 1.2e-8, alpha: 0.55, Eb: 25000 }
+
+  黄芪:
+    arrhenius: { Ea: 80000, A: 9.1e11, T_ref: 298.15, shelf_life_ref_months: 24 }
+    aw_critical: 0.63
+    photosensitive: false
+    light_degradation: { k_photo: 1.5e-8, alpha: 0.60, Eb: 27000 }
+
+  白术:
+    arrhenius: { Ea: 76000, A: 7.8e11, T_ref: 298.15, shelf_life_ref_months: 20 }
+    aw_critical: 0.58
+    photosensitive: false
+    light_degradation: { k_photo: 9.5e-9, alpha: 0.52, Eb: 24000 }
+
+  茯苓:
+    arrhenius: { Ea: 68000, A: 5.2e11, T_ref: 298.15, shelf_life_ref_months: 36 }
+    aw_critical: 0.66
+    photosensitive: false
+    light_degradation: { k_photo: 5.2e-9, alpha: 0.40, Eb: 22000 }
+
+  川芎:
+    arrhenius: { Ea: 82000, A: 1.0e12, T_ref: 298.15, shelf_life_ref_months: 22 }
+    aw_critical: 0.60
+    photosensitive: true
+    light_degradation: { k_photo: 2.8e-8, alpha: 0.72, Eb: 30000 }
+
+  白芍:
+    arrhenius: { Ea: 75000, A: 7.2e11, T_ref: 298.15, shelf_life_ref_months: 26 }
+    aw_critical: 0.61
+    photosensitive: false
+    light_degradation: { k_photo: 1.8e-8, alpha: 0.65, Eb: 26000 }
+
+  熟地:
+    arrhenius: { Ea: 88000, A: 1.4e12, T_ref: 298.15, shelf_life_ref_months: 16 }
+    aw_critical: 0.59
+    photosensitive: true
+    light_degradation: { k_photo: 3.2e-8, alpha: 0.78, Eb: 33000 }
+
+  桂枝:
+    arrhenius: { Ea: 70000, A: 5.8e11, T_ref: 298.15, shelf_life_ref_months: 28 }
+    aw_critical: 0.64
+    photosensitive: false
+    light_degradation: { k_photo: 1.6e-8, alpha: 0.62, Eb: 27000 }
+
+  麻黄:
+    arrhenius: { Ea: 73000, A: 6.5e11, T_ref: 298.15, shelf_life_ref_months: 15 }
+    aw_critical: 0.57
+    photosensitive: true
+    light_degradation: { k_photo: 4.1e-8, alpha: 0.80, Eb: 35000 }
+
+  细辛:
+    arrhenius: { Ea: 79000, A: 8.9e11, T_ref: 298.15, shelf_life_ref_months: 12 }
+    aw_critical: 0.55
+    photosensitive: true
+    light_degradation: { k_photo: 3.5e-8, alpha: 0.76, Eb: 31000 }
+
+  人参:
+    arrhenius: { Ea: 90000, A: 1.5e12, T_ref: 298.15, shelf_life_ref_months: 36 }
+    aw_critical: 0.56
+    photosensitive: false
+    light_degradation: { k_photo: 2.2e-8, alpha: 0.70, Eb: 29000 }
+
+  丹参:
+    arrhenius: { Ea: 83000, A: 1.1e12, T_ref: 298.15, shelf_life_ref_months: 20 }
+    aw_critical: 0.62
+    photosensitive: true
+    light_degradation: { k_photo: 2.6e-8, alpha: 0.74, Eb: 31000 }
+
+  五味子:
+    arrhenius: { Ea: 77000, A: 7.5e11, T_ref: 298.15, shelf_life_ref_months: 18 }
+    aw_critical: 0.58
+    photosensitive: false
+    light_degradation: { k_photo: 1.9e-8, alpha: 0.67, Eb: 28000 }
+
+# --- Baranyi-Roberts 微生物生长模型 ---
+microbial:
+  mu_max_base: 0.3          # 基础最大生长速率 (/h)
+  opt_temp: 25.0             # 最适温度 (°C)
+  min_temp: -2.0             # 最低生长温度 (°C)
+  max_temp: 45.0             # 最高生长温度 (°C)
+  opt_aw: 0.95               # 最适水分活度
+  min_aw: 0.60               # 最低生长水分活度
+  N0: 2.0                    # 初始菌量 (log CFU/g)
+  N_max: 7.0                 # 最大菌量 (log CFU/g)
+  h0: 2.0                    # 延迟期参数
+
+# --- 随机森林优先级模型 ---
+priority_model:
+  n_estimators: 200
+  max_depth: 10
+  min_samples_split: 5
+  random_state: 42
+  model_path: "priority_model.pkl"
+  features:
+    - avg_temp
+    - avg_humidity
+    - avg_aw
+    - avg_co2
+    - avg_ethylene
+    - shelf_life_days
+    - mold_risk
+    - aw_critical_delta
+  weights:
+    temperature: 0.25
+    aw: 0.30
+    mold: 0.25
+    shelf_life: 0.20
