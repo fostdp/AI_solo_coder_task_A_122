@@ -10,6 +10,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from .routers import tents, sensors, drugs, alerts
 from .services.alert import get_alert_service
 from .config import ALERT_CHECK_INTERVAL_MINUTES
+from .lora.ingest_worker import start_ingest_worker, stop_ingest_worker
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,6 +32,9 @@ def scheduled_alert_check():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # [FIX v1.1] 启动消息缓存队列 worker (LoRa 高频上报)
+    await start_ingest_worker()
+
     scheduler.add_job(
         scheduled_alert_check,
         "interval",
@@ -42,6 +46,8 @@ async def lifespan(app: FastAPI):
     logger.info("Scheduler started, alert check interval: %d minutes", ALERT_CHECK_INTERVAL_MINUTES)
     yield
     scheduler.shutdown()
+    # [FIX v1.1] 停止队列, 把剩余数据刷盘
+    await stop_ingest_worker()
     logger.info("Scheduler shutdown")
 
 
