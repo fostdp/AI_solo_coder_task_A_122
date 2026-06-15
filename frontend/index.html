@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>丝绸之路医疗帐篷微气候与药品变质预测系统</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+    <header class="app-header">
+        <div class="header-left">
+            <span class="logo-icon">⛺</span>
+            <h1>丝绸之路医疗帐篷微气候与药品变质预测系统</h1>
+        </div>
+        <div class="header-right">
+            <span class="status-dot" id="systemStatus"></span>
+            <span id="systemTime"></span>
+        </div>
+    </header>
+
+    <main class="app-main">
+        <section class="map-section">
+            <div id="map"></div>
+        </section>
+
+        <section class="detail-section" id="detailSection" style="display:none;">
+            <div class="detail-header">
+                <h2 id="tentName"></h2>
+                <button class="close-btn" onclick="closeDetail()">&times;</button>
+            </div>
+
+            <div class="detail-tabs">
+                <button class="tab-btn active" data-tab="heatmap" onclick="switchTab('heatmap')">变质风险热力图</button>
+                <button class="tab-btn" data-tab="trend" onclick="switchTab('trend')">微气候趋势</button>
+                <button class="tab-btn" data-tab="priority" onclick="switchTab('priority')">调配优先级</button>
+                <button class="tab-btn" data-tab="alerts" onclick="switchTab('alerts')">告警信息</button>
+            </div>
+
+            <div class="tab-content active" id="tab-heatmap">
+                <div class="heatmap-container">
+                    <canvas id="heatmapCanvas" width="600" height="400"></canvas>
+                    <div class="heatmap-legend">
+                        <span>低风险</span>
+                        <div class="legend-bar"></div>
+                        <span>高风险</span>
+                    </div>
+                </div>
+                <div id="heatmapTooltip" class="heatmap-tooltip" style="display:none;"></div>
+            </div>
+
+            <div class="tab-content" id="tab-trend">
+                <div class="chart-controls">
+                    <select id="trendHours" onchange="loadTrend()">
+                        <option value="24">最近24小时</option>
+                        <option value="48">最近48小时</option>
+                        <option value="72" selected>最近72小时</option>
+                        <option value="168">最近7天</option>
+                    </select>
+                </div>
+                <canvas id="trendChart" width="800" height="450"></canvas>
+                <div class="trend-legend" id="trendLegend"></div>
+            </div>
+
+            <div class="tab-content" id="tab-priority">
+                <table class="priority-table" id="priorityTable">
+                    <thead>
+                        <tr>
+                            <th>药材</th>
+                            <th>优先级</th>
+                            <th>评分</th>
+                            <th>原因</th>
+                        </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+
+            <div class="tab-content" id="tab-alerts">
+                <div class="alert-list" id="alertList"></div>
+            </div>
+        </section>
+    </main>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="/static/js/charts.js"></script>
+    <script src="/static/js/heatmap.js"></script>
+    <script src="/static/js/map.js"></script>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
