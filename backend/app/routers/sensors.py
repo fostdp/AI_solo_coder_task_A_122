@@ -4,44 +4,43 @@ from typing import List
 from ..database import get_client
 from ..config import CLICKHOUSE_DB
 from ..schemas import SensorReading, AwReading, SensorReadingBatch, AwReadingBatch, MicroClimateTrend
+from ..lora.ingest_worker import ingest_sensors_async, ingest_aw_async, ingest_stats
 
 router = APIRouter(prefix="/api/sensors", tags=["sensors"])
 
 
 @router.post("/readings")
-def ingest_sensor_readings(batch: SensorReadingBatch):
-    client = get_client()
+async def ingest_sensor_readings(batch: SensorReadingBatch):
+    """[FIX v1.1] 入队异步批量写入, 避免高频 LoRa 上报阻塞 worker"""
     data = [
-        (r.timestamp, r.tent_id, r.sensor_id, r.sensor_type, r.value)
+        {
+            "timestamp": r.timestamp,
+            "tent_id": r.tent_id,
+            "sensor_id": r.sensor_id,
+            "sensor_type": r.sensor_type,
+            "value": r.value,
+        }
         for r in batch.readings
     ]
-    client.execute(
-        f"""
-        INSERT INTO {CLICKHOUSE_DB}.sensor_readings
-        (timestamp, tent_id, sensor_id, sensor_type, value)
-        VALUES
-        """,
-        data,
-    )
-    return {"status": "ok", "count": len(data)}
+    await ingest_sensors_async(data)
+    return {"status": "queued", "count": len(data), **ingest_stats()}
 
 
 @router.post("/aw-readings")
-def ingest_aw_readings(batch: AwReadingBatch):
-    client = get_client()
+async def ingest_aw_readings(batch: AwReadingBatch):
+    """[FIX v1.1] 入队异步批量写入"""
     data = [
-        (r.timestamp, r.tent_id, r.meter_id, r.drug_name, r.water_activity)
+        {
+            "timestamp": r.timestamp,
+            "tent_id": r.tent_id,
+            "meter_id": r.meter_id,
+            "drug_name": r.drug_name,
+            "water_activity": r.water_activity,
+        }
         for r in batch.readings
     ]
-    client.execute(
-        f"""
-        INSERT INTO {CLICKHOUSE_DB}.aw_readings
-        (timestamp, tent_id, meter_id, drug_name, water_activity)
-        VALUES
-        """,
-        data,
-    )
-    return {"status": "ok", "count": len(data)}
+    await ingest_aw_async(data)
+    return {"status": "queued", "count": len(data), **ingest_stats()}
 
 
 @router.get("/latest/{tent_id}")
