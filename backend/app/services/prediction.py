@@ -61,11 +61,13 @@ class PredictionService:
             if not params:
                 continue
 
-            predictor = ArrheniusPredictor(params)
+            predictor = ArrheniusPredictor(params, drug_name=drug_name)
             aw = aw_data.get(drug_name, 0.5)
+            light = climate["light"]
 
-            shelf_life = predictor.shelf_life_with_aw_correction(climate["temperature"], aw)
+            shelf_life = predictor.shelf_life_with_aw_correction(climate["temperature"], aw, light)
             mold_risk = self.baranyi.mold_risk_score(climate["temperature"], aw)
+            light_pct = predictor.light_contribution_pct(climate["temperature"], light)
 
             results.append({
                 "tent_id": tent_id,
@@ -74,7 +76,9 @@ class PredictionService:
                 "mold_risk": round(mold_risk, 4),
                 "avg_temperature": round(climate["temperature"], 2),
                 "avg_humidity": round(climate["humidity"], 2),
+                "avg_light": round(light, 1),
                 "avg_aw": round(aw, 4),
+                "light_degradation_pct": round(light_pct, 1),
                 "avg_co2": round(climate.get("co2", 400), 1),
                 "avg_ethylene": round(climate.get("ethylene", 0.5), 3),
                 "aw_critical": params["aw_critical"],
@@ -189,11 +193,22 @@ class PredictionService:
 
         for meter_id, drug_name, avg_aw in aw_rows:
             params = DRUG_PARAMS.get(drug_name, {})
-            predictor = ArrheniusPredictor(params) if params else None
+            predictor = ArrheniusPredictor(params, drug_name=drug_name) if params else None
             mold = self.baranyi.mold_risk_score(climate["temperature"], avg_aw)
-            shelf = predictor.shelf_life_with_aw_correction(climate["temperature"], avg_aw) if predictor else 999
+            shelf = predictor.shelf_life_with_aw_correction(
+                climate["temperature"], avg_aw, climate["light"]
+            ) if predictor else 999
+            light_risk = 0.0
+            if predictor is not None:
+                light_pct = predictor.light_contribution_pct(climate["temperature"], climate["light"])
+                light_risk = light_pct / 100.0
 
-            risk_score = mold * 60 + max(0, (avg_aw - 0.5) / 0.3) * 20 + max(0, (climate["temperature"] - 20) / 20) * 20
+            risk_score = (
+                mold * 50
+                + max(0, (avg_aw - 0.5) / 0.3) * 15
+                + max(0, (climate["temperature"] - 20) / 20) * 15
+                + light_risk * 20
+            )
 
             heatmap.append({
                 "meter_id": meter_id,
