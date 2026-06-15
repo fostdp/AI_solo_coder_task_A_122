@@ -2,23 +2,145 @@
 API Gateway - 主服务入口
 整合所有微服务, 提供 REST API 和前端静态文件
 
-服务间通信:
-  - 同步调用: 直接 import 各服务的 service 类 (单进程模式)
-  - 异步消息: 通过 Redis Stream (多进程/多节点模式)
-
-架构:
-  lora_ingest   ->  sensor_raw stream  -> arrhenius_predictor
-                    \                    -> microbial_model
-                     \                    \
-                      -> drug_risk stream  -> alert_broker
+[v3 工程化] 增加:
+  - loguru 结构化日志 (JSON, 可配置文件输出)
+  - Prometheus 指标: http 请求量/延迟、LoRa 采集、模型预测耗时
+  - /healthz 健康检查、/metrics 指标端点
 """
+import os
+import sys
+import time
+import socket
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Optional
 
-from fastapi import FastAPI, Query
+# ------------------------------------------------------------
+#  loguru 初始化 (必须在 import logging 相关之前)
+# ------------------------------------------------------------
+try:
+    from loguru import logger
+except ImportError:
+    logger = __import__("logging").getLogger("silkroad")
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_FILE = os.getenv("LOG_FILE", "")
+
+def _setup_logger():
+    """配置 loguru: 控制台 + 可选文件 (JSON Lines 格式)"""
+    logger.remove()
+
+    fmt_color = (
+        "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
+        "<level>{message}</level>"
+    )
+    logger.add(
+        sys.stdout,
+        level=LOG_LEVEL,
+        format=fmt_color,
+        colorize=True,
+        enqueue=True,
+        backtrace=False,
+        diagnose=False,
+    )
+
+    if LOG_FILE:
+        logger.add(
+            LOG_FILE,
+            level=LOG_LEVEL,
+            rotation="100 MB",
+            retention="14 days",
+            compression="gz",
+            serialize=True,
+            enqueue=True,
+            encoding="utf-8",
+        )
+
+    # 把标准 logging 转发到 loguru
+    class InterceptHandler(logging.Handler):
+        def emit(self, record):
+            try:
+                level = logger.level(record.levelname).name
+            except ValueError:
+                level = record.levelno
+            frame, depth = logging.currentframe(), 2
+            while frame and frame.f_code.co_filename == logging.__file__:
+                frame = frame.f_back
+                depth += 1
+            logger.opt(depth=depth, exception=record.exc_info).log(
+                level, record.getMessage()
+            )
+
+    logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
+
+_setup_logger()
+
+# ------------------------------------------------------------
+#  Prometheus 指标
+# ------------------------------------------------------------
+try:
+    from prometheus_client import (
+        Counter, Histogram, Gauge,
+        CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST,
+    )
+
+    METRIC_REGISTRY = CollectorRegistry()
+
+    HTTP_REQUESTS = Counter(
+        "silkroad_http_requests_total",
+        "Total HTTP requests",
+        ["method", "path", "status_code"],
+        registry=METRIC_REGISTRY,
+    )
+    HTTP_DURATION = Histogram(
+        "silkroad_http_request_duration_seconds",
+        "HTTP request duration",
+        ["method", "path"],
+        buckets=(0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 3.0, 5.0, 10.0, 30.0),
+        registry=METRIC_REGISTRY,
+    )
+    LORA_INGEST = Counter(
+        "silkroad_lora_ingest_total",
+        "LoRa ingest counts",
+        ["type", "result"],
+        registry=METRIC_REGISTRY,
+    )
+    PREDICT_DURATION = Histogram(
+        "silkroad_model_predict_duration_seconds",
+        "Model prediction duration",
+        ["service", "action"],
+        buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0),
+        registry=METRIC_REGISTRY,
+    )
+    ALERTS_TOTAL = Counter(
+        "silkroad_alerts_total",
+        "Alert count",
+        ["type", "severity"],
+        registry=METRIC_REGISTRY,
+    )
+    SERVICE_STATUS = Gauge(
+        "silkroad_service_status",
+        "Up/Down status of each internal service",
+        ["service"],
+        registry=METRIC_REGISTRY,
+    )
+    PROM_ENABLED = True
+    logger.info("Prometheus metrics enabled")
+except Exception as e:
+    logger.warning("Prometheus disabled: {0}", e)
+    PROM_ENABLED = False
+
+# ------------------------------------------------------------
+#  FastAPI + 服务
+# ------------------------------------------------------------
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from shared.config_loader import get_tents, get_tent
 from shared.redis_streams import RedisStreamClient
@@ -28,117 +150,201 @@ from services.arrhenius_predictor.service import ArrheniusService
 from services.microbial_model.service import MicrobialService
 from services.alert_broker.service import AlertBrokerService
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 
-
-# 单例服务实例
 _services: dict = {}
 
 
+# ------------------------------------------------------------
+#  中间件: Prometheus HTTP 指标
+# ------------------------------------------------------------
+class PrometheusMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        start = time.perf_counter()
+        response = await call_next(request)
+        duration = time.perf_counter() - start
+
+        if PROM_ENABLED and not request.url.path.startswith("/metrics"):
+            path = _normalize_path(request.url.path)
+            HTTP_REQUESTS.labels(
+                method=request.method, path=path,
+                status_code=str(response.status_code),
+            ).inc()
+            HTTP_DURATION.labels(method=request.method, path=path).observe(duration)
+        return response
+
+
+def _normalize_path(p: str) -> str:
+    parts = p.rstrip("/").split("/")
+    out = []
+    for part in parts:
+        if part.isdigit():
+            out.append("{id}")
+        else:
+            out.append(part)
+    return "/".join(out) or "/"
+
+
+# ------------------------------------------------------------
+#  Lifespan
+# ------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时: 初始化所有服务
+    logger.info("Starting API Gateway v2 on host={host}", host=socket.gethostname())
+
     redis_client = RedisStreamClient()
     try:
         await redis_client.connect()
+        logger.success("Redis Stream connected")
     except Exception as e:
-        logger.warning("Redis not available, running in library-only mode: %s", e)
+        logger.warning("Redis not available, library-only mode: {e}", e=e)
         redis_client = None
 
-    # 初始化各服务 (库模式, 不消费 stream)
-    lora_svc = LoraIngestService(redis_client=redis_client)
-    await lora_svc.start()
-    _services["lora"] = lora_svc
+    for name, cls, kwargs in [
+        ("lora",      LoraIngestService,      {}),
+        ("arrhenius", ArrheniusService,       {"consume_stream": False}),
+        ("microbial", MicrobialService,       {"consume_stream": False}),
+        ("alert",     AlertBrokerService,     {"with_scheduler": False}),
+    ]:
+        try:
+            t0 = time.perf_counter()
+            svc = cls(redis_client=redis_client)
+            await svc.start(**kwargs)
+            _services[name] = svc
+            if PROM_ENABLED:
+                SERVICE_STATUS.labels(service=name).set(1)
+            logger.success("Service started: {n} ({t:.2f}ms)",
+                           n=name, t=(time.perf_counter() - t0) * 1000)
+        except Exception as e:
+            logger.error("Failed to start service {n}: {e}", n=name, e=e)
+            if PROM_ENABLED:
+                SERVICE_STATUS.labels(service=name).set(0)
 
-    arrhenius_svc = ArrheniusService(redis_client=redis_client)
-    await arrhenius_svc.start(consume_stream=False)
-    _services["arrhenius"] = arrhenius_svc
-
-    microbial_svc = MicrobialService(redis_client=redis_client)
-    await microbial_svc.start(consume_stream=False)
-    _services["microbial"] = microbial_svc
-
-    alert_svc = AlertBrokerService(redis_client=redis_client)
-    await alert_svc.start(with_scheduler=False)
-    _services["alert"] = alert_svc
-
-    logger.info("API Gateway started with all services")
     yield
 
-    # 关闭时: 停止所有服务
     for name, svc in reversed(list(_services.items())):
         try:
             await svc.stop()
-            logger.info("Service stopped: %s", name)
+            logger.info("Service stopped: {n}", n=name)
         except Exception as e:
-            logger.error("Error stopping service %s: %s", name, e)
+            logger.error("Error stopping {n}: {e}", n=name, e=e)
     _services.clear()
+    logger.info("API Gateway shutdown complete")
 
 
 app = FastAPI(
     title="丝绸之路医疗帐篷微气候与药品变质预测系统",
     description="敦煌悬泉置汉代医疗帐篷 - 微气候监测与药品变质风险预测 API",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
+app.add_middleware(PrometheusMiddleware)
 
-app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+if FRONTEND_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+
+
+# ============================================================
+#  核心端点: /healthz /metrics
+# ============================================================
+@app.get("/healthz", tags=["system"])
+async def healthz():
+    """Kubernetes / Docker 健康检查端点"""
+    unhealthy = []
+    for n, svc in _services.items():
+        try:
+            ok = getattr(svc, "healthy", True)
+            if not ok:
+                unhealthy.append(n)
+        except Exception:
+            pass
+    status = "healthy" if not unhealthy else "degraded"
+    return {
+        "status": status,
+        "version": "2.1.0",
+        "services": list(_services.keys()),
+        "unhealthy": unhealthy,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+@app.get("/metrics", tags=["system"])
+async def prometheus_metrics():
+    """Prometheus 抓取端点"""
+    if not PROM_ENABLED:
+        return PlainTextResponse("# Prometheus metrics disabled\n", status_code=501)
+    from fastapi.responses import Response
+    data = generate_latest(METRIC_REGISTRY)
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/")
 async def serve_frontend():
-    return FileResponse(str(FRONTEND_DIR / "index.html"))
+    if FRONTEND_DIR.exists():
+        return FileResponse(str(FRONTEND_DIR / "index.html"))
+    return {"message": "Silk Road Medical Tent API v2.1", "docs": "/docs"}
 
 
-@app.get("/api/health")
-async def health_check():
-    return {"status": "healthy", "version": "2.0.0"}
-
-
-# --- Tents ---
-@app.get("/api/tents/")
+# ============================================================
+#  Tents
+# ============================================================
+@app.get("/api/tents/", tags=["tents"])
 def list_tents():
     return get_tents()
 
 
-@app.get("/api/tents/{tent_id}")
+@app.get("/api/tents/{tent_id}", tags=["tents"])
 def get_tent_info(tent_id: int):
     tent = get_tent(tent_id)
     if not tent:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Tent not found")
     return tent
 
 
-# --- Sensors / LoRa Ingest ---
-@app.post("/api/sensors/readings")
+# ============================================================
+#  Sensors / LoRa Ingest
+# ============================================================
+@app.post("/api/sensors/readings", tags=["sensors"])
 async def ingest_sensor_readings(batch: dict):
-    """批量接收传感器数据 (LoRa 上行)"""
     svc: LoraIngestService = _services["lora"]
     readings = batch.get("readings", [])
+    t0 = time.perf_counter()
     result = await svc.ingest_sensors(readings)
+    dur = time.perf_counter() - t0
+
+    if PROM_ENABLED:
+        rtype = "sensor"
+        LORA_INGEST.labels(type=rtype, result="ok").inc(result.get("ingested", 0))
+        LORA_INGEST.labels(type=rtype, result="dup").inc(result.get("duplicates", 0))
+        PREDICT_DURATION.labels(service="lora", action="ingest").observe(dur)
+
+    logger.info("LoRa ingest: {n} readings, {d} duplicates in {t:.1f}ms",
+                n=result.get("ingested", 0), d=result.get("duplicates", 0),
+                t=dur * 1000)
     return result
 
 
-@app.post("/api/sensors/aw-readings")
+@app.post("/api/sensors/aw-readings", tags=["sensors"])
 async def ingest_aw_readings(batch: dict):
-    """批量接收水分活度数据"""
     svc: LoraIngestService = _services["lora"]
     readings = batch.get("readings", [])
+    t0 = time.perf_counter()
     result = await svc.ingest_aw(readings)
+    dur = time.perf_counter() - t0
+
+    if PROM_ENABLED:
+        LORA_INGEST.labels(type="aw", result="ok").inc(result.get("ingested", 0))
+        LORA_INGEST.labels(type="aw", result="dup").inc(result.get("duplicates", 0))
+        PREDICT_DURATION.labels(service="lora", action="ingest_aw").observe(dur)
+
     return result
 
 
-@app.get("/api/sensors/trend/{tent_id}")
+@app.get("/api/sensors/trend/{tent_id}", tags=["sensors"])
 def get_sensor_trend(tent_id: int, hours: int = Query(default=72, le=168)):
-    """获取微气候趋势数据"""
-    from shared.clickhouse_client import get_client
+    from shared.clickhouse_client import get_client, query_rows
     from shared.config_loader import get_clickhouse_config
-    from datetime import datetime, timedelta
 
     ch_cfg = get_clickhouse_config()
     client = get_client(
@@ -148,16 +354,14 @@ def get_sensor_trend(tent_id: int, hours: int = Query(default=72, le=168)):
     )
     since = datetime.utcnow() - timedelta(hours=hours)
 
-    rows = client.execute(
-        f"""
+    sql = f"""
         SELECT toStartOfInterval(timestamp, INTERVAL 30 MINUTE) as t, sensor_type, avg(value)
         FROM {ch_cfg['database']}.sensor_readings
         WHERE tent_id = %(tid)s AND timestamp >= %(since)s
         GROUP BY t, sensor_type
         ORDER BY t
-        """,
-        {"tid": tent_id, "since": since},
-    )
+    """
+    rows = query_rows(client, sql, {"tid": tent_id, "since": since})
 
     trend = {"timestamps": [], "temperature": [], "humidity": [],
              "light": [], "ethylene": [], "co2": []}
@@ -177,28 +381,35 @@ def get_sensor_trend(tent_id: int, hours: int = Query(default=72, le=168)):
     return trend
 
 
-# --- Drugs / Predictions ---
-@app.get("/api/drugs/risks/{tent_id}")
+# ============================================================
+#  Drugs / Predictions
+# ============================================================
+@app.get("/api/drugs/risks/{tent_id}", tags=["drugs"])
 def get_drug_risks(tent_id: int):
-    """获取某帐篷所有药材的风险评估 (有效期 + 霉变)"""
     tent = get_tent(tent_id)
     if not tent:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Tent not found")
 
-    # 简化: 模拟 climate 和 aw 数据
-    # 实际生产环境应从 ClickHouse 查询 24h 均值
     climate = {"temperature": 25, "humidity": 50, "light": 300,
                "co2": 400, "ethylene": 0.5}
     aw_data = {drug: 0.5 for drug in tent["drugs"]}
 
+    t0 = time.perf_counter()
     arr: ArrheniusService = _services["arrhenius"]
     arr_results = arr.predict_tent_drugs(tent_id, climate, aw_data)
+    if PROM_ENABLED:
+        PREDICT_DURATION.labels(service="arrhenius", action="predict").observe(
+            time.perf_counter() - t0
+        )
 
+    t1 = time.perf_counter()
     mic: MicrobialService = _services["microbial"]
     mic_results = mic.assess_tent_drugs(tent_id, climate["temperature"], aw_data)
+    if PROM_ENABLED:
+        PREDICT_DURATION.labels(service="microbial", action="assess").observe(
+            time.perf_counter() - t1
+        )
 
-    # 合并结果
     mic_dict = {r["drug_name"]: r for r in mic_results}
     combined = []
     for a in arr_results:
@@ -212,12 +423,9 @@ def get_drug_risks(tent_id: int):
     return combined
 
 
-@app.get("/api/drugs/priorities/{tent_id}")
+@app.get("/api/drugs/priorities/{tent_id}", tags=["drugs"])
 def get_drug_priorities(tent_id: int):
-    """获取药品调配优先级建议"""
     risks = get_drug_risks(tent_id)
-
-    # 简化版优先级评分 (实际应使用随机森林模型)
     priorities = []
     for r in risks:
         score = 0.0
@@ -244,7 +452,6 @@ def get_drug_priorities(tent_id: int):
                 reasons.append(f"有效期不足({r['shelf_life_days']:.0f}天)")
 
         score = min(100, max(0, score))
-
         if score >= 75:
             level = "紧急"
         elif score >= 50:
@@ -265,23 +472,17 @@ def get_drug_priorities(tent_id: int):
     return sorted(priorities, key=lambda x: -x["priority_score"])
 
 
-@app.get("/api/drugs/heatmap/{tent_id}")
+@app.get("/api/drugs/heatmap/{tent_id}", tags=["drugs"])
 def get_drug_heatmap(tent_id: int):
-    """获取药品变质风险热力图数据"""
     tent = get_tent(tent_id)
     if not tent:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Tent not found")
 
-    # 简化: 10 个检测位的模拟数据
-    # 实际生产环境应从 Aw readings 聚合
-    from datetime import datetime
     risks = get_drug_risks(tent_id)
     heatmap = []
     meter_id = 1
-
     for r in risks:
-        for i in range(3):  # 每种药材 3 个检测位
+        for i in range(3):
             risk_score = r["mold_risk"] * 0.6 + 0.4 * max(0, (r["avg_aw"] - 0.5) / 0.3)
             risk_score = min(1.0, risk_score)
             heatmap.append({
@@ -300,7 +501,6 @@ def get_drug_heatmap(tent_id: int):
         if meter_id > 10:
             break
 
-    # 补足到 10 个
     while len(heatmap) < 10 and len(risks) > 0:
         r = risks[-1]
         risk_score = r["mold_risk"] * 0.5 + 0.3
@@ -319,13 +519,13 @@ def get_drug_heatmap(tent_id: int):
     return heatmap
 
 
-# --- Alerts ---
-@app.get("/api/alerts/")
-def list_alerts(tent_id: int = None, hours: int = Query(default=24, le=168)):
-    """获取告警列表"""
-    from shared.clickhouse_client import get_client
+# ============================================================
+#  Alerts
+# ============================================================
+@app.get("/api/alerts/", tags=["alerts"])
+def list_alerts(tent_id: Optional[int] = None, hours: int = Query(default=24, le=168)):
+    from shared.clickhouse_client import get_client, query_rows
     from shared.config_loader import get_clickhouse_config
-    from datetime import datetime, timedelta
 
     ch_cfg = get_clickhouse_config()
     client = get_client(
@@ -335,26 +535,20 @@ def list_alerts(tent_id: int = None, hours: int = Query(default=24, le=168)):
     )
     since = datetime.utcnow() - timedelta(hours=hours)
 
+    base = """
+        SELECT timestamp, tent_id, alert_type, severity, value, threshold,
+               duration_hours, message, notified
+        FROM {db}.alerts
+    """.format(db=ch_cfg['database'])
+
     if tent_id:
-        sql = f"""
-            SELECT timestamp, tent_id, alert_type, severity, value, threshold,
-                   duration_hours, message, notified
-            FROM {ch_cfg['database']}.alerts
-            WHERE tent_id = %(tid)s AND timestamp >= %(since)s
-            ORDER BY timestamp DESC
-        """
+        sql = base + " WHERE tent_id = %(tid)s AND timestamp >= %(since)s ORDER BY timestamp DESC"
         params = {"tid": tent_id, "since": since}
     else:
-        sql = f"""
-            SELECT timestamp, tent_id, alert_type, severity, value, threshold,
-                   duration_hours, message, notified
-            FROM {ch_cfg['database']}.alerts
-            WHERE timestamp >= %(since)s
-            ORDER BY timestamp DESC LIMIT 100
-        """
+        sql = base + " WHERE timestamp >= %(since)s ORDER BY timestamp DESC LIMIT 100"
         params = {"since": since}
 
-    rows = client.execute(sql, params)
+    rows = query_rows(client, sql, params)
     alerts = []
     for ts, tid, atype, sev, val, thr, dur, msg, notif in rows:
         alerts.append({
@@ -371,17 +565,26 @@ def list_alerts(tent_id: int = None, hours: int = Query(default=24, le=168)):
     return alerts
 
 
-@app.post("/api/alerts/check")
+@app.post("/api/alerts/check", tags=["alerts"])
 async def trigger_alerts_check():
-    """手动触发告警检查"""
     svc: AlertBrokerService = _services["alert"]
     results = await svc.run_alerts_check()
+
+    if PROM_ENABLED:
+        for a in results:
+            ALERTS_TOTAL.labels(
+                type=a.get("alert_type", "unknown"),
+                severity=a.get("severity", "warning"),
+            ).inc()
+
+    logger.warning("Alert check produced {n} alerts", n=len(results))
     return {"status": "ok", "alerts_count": len(results), "alerts": results}
 
 
-# --- Lora stats ---
-@app.get("/api/lora/stats")
+# ============================================================
+#  LoRa stats
+# ============================================================
+@app.get("/api/lora/stats", tags=["lora"])
 def get_lora_stats():
-    """LoRa 采集服务状态"""
     svc: LoraIngestService = _services["lora"]
     return svc.stats

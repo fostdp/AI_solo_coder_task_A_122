@@ -1,0 +1,31 @@
+# ============================================================
+#  LoRa 模拟器镜像
+#  基于 runtime 复用依赖, 只添加模拟器代码
+# ============================================================
+FROM python:3.11-slim-bookworm AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    APP_HOME=/app \
+    TZ=Asia/Shanghai
+
+WORKDIR $APP_HOME
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libopenblas0 libgfortran5 libquadmath0 tzdata curl \
+    && ln -sf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone \
+    && rm -rf /var/lib/apt/lists/*
+
+# 共享依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 代码
+COPY . .
+
+RUN mkdir -p /app/logs
+
+# 模拟器入口通过 command 传递 (docker-compose.yml 中定义)
+ENTRYPOINT ["python"]
+CMD ["simulator/lora_simulator.py", "--tents", "5", "--interval", "30", "--spoil", "0"]

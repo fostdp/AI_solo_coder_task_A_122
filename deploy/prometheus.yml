@@ -1,0 +1,41 @@
+# ============================================================
+#  Prometheus 抓取配置
+# ============================================================
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  scrape_timeout:      10s
+
+  external_labels:
+    environment: production
+    application: silkroad-medical-tent
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+scrape_configs:
+  # 1. 后端 Python 指标
+  - job_name: 'backend-api'
+    static_configs:
+      - targets: ['backend:9090']
+    metrics_path: /metrics
+    honor_labels: true
+
+  # 2. ClickHouse (通过 clickhouse-exporter)
+  - job_name: 'clickhouse'
+    static_configs:
+      - targets: ['clickhouse:9363']
+    metrics_path: /metrics
+    params:
+      enable_metrics:
+        - clickhouse
+    tls_config:
+      insecure_skip_verify: true
+
+  # 3. Redis Exporter (可选, 需要另加 redis-exporter 容器)
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:9121']
+    metrics_path: /metrics
