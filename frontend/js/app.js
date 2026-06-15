@@ -8,6 +8,13 @@ async function init() {
     setInterval(updateClock, 1000);
     checkSystemHealth();
     setInterval(checkSystemHealth, 30000);
+    // [FIX v1.1] 移动端页面切后台/销毁时释放 Canvas ImageData 缓存
+    window.addEventListener('pagehide', () => {
+        if (typeof HeatmapCanvasV2 !== 'undefined') HeatmapCanvasV2.destroy();
+    });
+    window.addEventListener('beforeunload', () => {
+        if (typeof HeatmapCanvasV2 !== 'undefined') HeatmapCanvasV2.destroy();
+    });
 }
 
 function updateClock() {
@@ -68,10 +75,16 @@ async function loadHeatmap(tentId) {
     try {
         const resp = await fetch(`/api/drugs/heatmap/${tentId}`);
         const data = await resp.json();
-        heatmapHitAreas = HeatmapRenderer.draw(canvas, data);
+        // [FIX v1.1] 切换到 V2 ImageData 复用渲染器, 避免移动端内存泄漏
+        heatmapHitAreas = (typeof HeatmapCanvasV2 !== 'undefined')
+            ? HeatmapCanvasV2.draw(canvas, data)
+            : HeatmapRenderer.draw(canvas, data);
     } catch (e) {
         console.error('Heatmap load failed:', e);
-        heatmapHitAreas = HeatmapRenderer.draw(canvas, []);
+        const empty = (typeof HeatmapCanvasV2 !== 'undefined')
+            ? HeatmapCanvasV2.draw(canvas, [])
+            : HeatmapRenderer.draw(canvas, []);
+        heatmapHitAreas = empty;
     }
 
     canvas.onmousemove = (e) => {
